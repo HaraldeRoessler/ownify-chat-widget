@@ -37,8 +37,9 @@ Optional `data-*` attributes:
 - `data-greeting` — first agent message shown before any user input
 - `data-placeholder` — input placeholder text
 - `data-base-url` — override the host (default: `https://ownify.ai`)
-- `data-endpoint` — override the full POST URL
-- `data-caller-did` — optional `X-Caller-DID` header (audit-only, no auth)
+- `data-endpoint` — override the full POST URL (validated as http/https, embedded credentials rejected)
+- `data-caller-did` — optional `X-Caller-DID` header (shape-validated against `did:method:id` pattern; audit-only, no auth)
+- `data-style-nonce` — CSP nonce for the injected `<style>` tag (see "CSP" below)
 
 ### Step 2b — npm package (for React / Vue / Svelte / build pipelines)
 
@@ -59,6 +60,46 @@ handle.destroy();
 ```
 
 Same widget, same behaviour, importable wherever.
+
+## Subresource Integrity (recommended for the script tag)
+
+For defence against a compromised CDN, pin the script with SRI:
+
+```html
+<script src="https://ownify.ai/chat-widget.js"
+        integrity="sha384-..."
+        crossorigin="anonymous"
+        defer></script>
+```
+
+The current `0.1.1` integrity hash is published with each release in
+[CHANGELOG.md](./CHANGELOG.md). Bump the hash when you upgrade.
+
+## Content-Security-Policy
+
+The widget injects an inline `<style>` tag for its own scoped styles.
+On strict-CSP sites (no `style-src 'unsafe-inline'`), pass a nonce
+matching your `style-src 'nonce-...'` directive:
+
+```html
+<script src="https://ownify.ai/chat-widget.js" defer></script>
+<div data-ownify-chat
+     data-slug="your-tenant"
+     data-style-nonce="<your-csp-nonce>"></div>
+```
+
+Or via the npm API: `mountOwnifyChat(root, { slug, styleNonce })`.
+
+## Limits
+
+- **Message length**: 4096 characters per message. Longer input is
+  truncated client-side; the server applies its own 64 KiB body cap.
+- **Submit cooldown**: 500 ms between consecutive sends.
+- **Fetch timeout**: 30 s per request — aborts and surfaces as
+  "Request timed out." in the chat.
+
+All three are configurable via `mountOwnifyChat(root, { fetchTimeoutMs,
+submitCooldownMs, maxMessageLength })`.
 
 ## Self-hosted ownify deployments
 

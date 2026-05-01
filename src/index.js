@@ -1,11 +1,11 @@
 // ownify-chat-widget — programmatic API for build-system users.
 //
 // Two ways to use the widget:
-//   1. Drop the standalone <script src="https://ownify.ai/chat-widget.js">
-//      onto any HTML page (zero build, the standalone version is at
-//      src/standalone.js if you want to self-host that file).
-//   2. import { mountOwnifyChat } from 'ownify-chat-widget' inside your
-//      React/Vue/Svelte/whatever app and call mountOwnifyChat(rootEl, opts).
+//   1. Standalone <script src="https://ownify.ai/chat-widget.js"> on
+//      any HTML page (zero build, src/standalone.js).
+//   2. import { mountOwnifyChat } from 'ownify-chat-widget' inside
+//      your React/Vue/Svelte/whatever app and call mountOwnifyChat
+//      (rootEl, opts).
 //
 // The behaviour is identical: a small chat box that POSTs visitor
 // messages to https://ownify.ai/api/chat/<slug> (or your own
@@ -15,6 +15,16 @@
 const DEFAULT_BASE_URL = 'https://ownify.ai';
 const DEFAULT_GREETING = 'Hi! Ask me anything.';
 const DEFAULT_PLACEHOLDER = 'Type a message…';
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const DEFAULT_SUBMIT_COOLDOWN_MS = 500;
+const MAX_MESSAGE_LENGTH = 4096;
+const VERSION = '0.1.1';
+
+// Same shape the receiver-side library validates against. Audit-only
+// header — the server never trusts it for authorization, but we
+// shape-validate before forwarding to avoid spoofing arbitrary
+// values into the receiver's audit log.
+const DID_PATTERN = /^did:[a-z0-9]{1,32}:[A-Za-z0-9._-]{1,256}$/;
 
 const STYLE_ID = 'ownify-chat-widget-styles';
 const STYLES = ''
@@ -36,74 +46,139 @@ const STYLES = ''
   + '.ow-chat-meta{font-size:11px;color:var(--ow-meta,#888);text-align:center;padding:8px;border-top:1px solid var(--ow-border,#2a2a2a)}'
   + '.ow-chat-meta a{color:inherit}';
 
-function ensureStyles(doc) {
+function ensureStyles(doc, nonce) {
   if (doc.getElementById(STYLE_ID)) return;
   const style = doc.createElement('style');
   style.id = STYLE_ID;
   style.textContent = STYLES;
+  // CSP-strict pages can pass `styleNonce` so the inline <style> is
+  // allowed under a nonce-based style-src directive.
+  if (nonce) style.nonce = String(nonce);
   doc.head.appendChild(style);
+}
+
+// Validate an endpoint URL. Rejects non-http(s), embedded credentials,
+// and any URL that fails to parse. Defends against an attacker who
+// can clobber data-endpoint on the mount node redirecting messages
+// to a phishing endpoint.
+function validateEndpoint(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (u.username || u.password) return false;
+  return true;
 }
 
 /**
  * Mount the chat widget onto a DOM element.
  *
- * @param {HTMLElement} root — the element to mount into. Existing
- *                              children are replaced.
+ * @param {HTMLElement} root
  * @param {object} opts
- *   @param {string} opts.slug              — REQUIRED. Your ownify tenant slug.
- *   @param {string} [opts.baseUrl]         — base URL of the chat backend.
- *                                             Default 'https://ownify.ai'. Override
- *                                             for self-hosted ownify deployments.
- *   @param {string} [opts.endpoint]        — full POST URL. Overrides baseUrl
- *                                             entirely if set.
- *   @param {string} [opts.greeting]        — first agent message shown before
- *                                             any user input.
- *   @param {string} [opts.placeholder]     — input placeholder text.
- *   @param {string} [opts.callerDid]       — optional X-Caller-DID header
- *                                             (audit-only; not used for auth).
- *   @param {string} [opts.client='ownify-chat-widget@<version>'] — X-Ownify-Client
- *                                             header value used in audit.
+ *   @param {string} opts.slug                — REQUIRED. Receiver tenant slug.
+ *   @param {string} [opts.baseUrl]           — default 'https://ownify.ai'
+ *   @param {string} [opts.endpoint]          — overrides baseUrl entirely
+ *   @param {string} [opts.greeting]
+ *   @param {string} [opts.placeholder]
+ *   @param {string} [opts.callerDid]         — optional X-Caller-DID (audit-only)
+ *   @param {string} [opts.client]            — X-Ownify-Client header value
+ *   @param {string} [opts.styleNonce]        — CSP nonce for the injected <style>
+ *   @param {number} [opts.fetchTimeoutMs=30000]
+ *   @param {number} [opts.submitCooldownMs=500] — debounce between user submits
+ *   @param {number} [opts.maxMessageLength=4096]
  *
- * @returns {{ destroy: () => void }} handle for unmounting
+ * @returns {{ destroy: () => void }}
  */
 export function mountOwnifyChat(root, opts) {
-  if (!root || !(root instanceof HTMLElement)) {
+  if (!root || typeof root !== 'object' || root.nodeType !== 1) {
     throw new Error('mountOwnifyChat: root must be an HTMLElement');
   }
-  if (!opts || typeof opts.slug !== 'string' || opts.slug.length === 0) {
-    throw new Error('mountOwnifyChat: opts.slug is required');
+  if (!opts || typeof opts.slug !== 'string' || opts.slug.trim().length === 0) {
+    throw new Error('mountOwnifyChat: opts.slug is required (non-empty string)');
+  }
+  if (root.dataset && root.dataset.ownifyChatInit === '1') {
+    throw new Error('mountOwnifyChat: this root is already mounted — call destroy() first');
   }
 
-  const slug = opts.slug;
-  const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
-  const endpoint = opts.endpoint || (baseUrl + '/api/chat/' + encodeURIComponent(slug));
-  const greeting = opts.greeting || DEFAULT_GREETING;
-  const placeholder = opts.placeholder || DEFAULT_PLACEHOLDER;
-  const callerDid = opts.callerDid || null;
-  const client = opts.client || 'ownify-chat-widget@0.1.0';
+  const slug = opts.slug.trim();
+  const baseUrl = String(opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const endpoint = opts.endpoint != null
+    ? String(opts.endpoint)
+    : (baseUrl + '/api/chat/' + encodeURIComponent(slug));
+  if (!validateEndpoint(endpoint)) {
+    throw new Error('mountOwnifyChat: endpoint must be a valid http(s) URL without embedded credentials');
+  }
 
-  ensureStyles(document);
+  const greeting = String(opts.greeting || DEFAULT_GREETING);
+  const placeholder = String(opts.placeholder || DEFAULT_PLACEHOLDER);
+  const client = String(opts.client || ('ownify-chat-widget@' + VERSION));
+  const fetchTimeoutMs = Number.isFinite(opts.fetchTimeoutMs) && opts.fetchTimeoutMs > 0
+    ? opts.fetchTimeoutMs : DEFAULT_FETCH_TIMEOUT_MS;
+  const submitCooldownMs = Number.isFinite(opts.submitCooldownMs) && opts.submitCooldownMs >= 0
+    ? opts.submitCooldownMs : DEFAULT_SUBMIT_COOLDOWN_MS;
+  const maxMessageLength = Number.isInteger(opts.maxMessageLength) && opts.maxMessageLength > 0
+    ? opts.maxMessageLength : MAX_MESSAGE_LENGTH;
 
-  root.innerHTML = ''
-    + '<div class="ow-chat">'
-    + '  <div class="ow-chat-log" role="log" aria-live="polite"></div>'
-    + '  <form class="ow-chat-form">'
-    + '    <input class="ow-chat-input" type="text" autocomplete="off" />'
-    + '    <button class="ow-chat-send" type="submit">Send</button>'
-    + '  </form>'
-    + '  <div class="ow-chat-meta">Powered by <a href="https://ownify.ai" target="_blank" rel="noopener">ownify</a> · agent-to-agent</div>'
-    + '</div>';
+  // Validate caller DID shape before forwarding. Audit-only signal
+  // server-side; rejecting bad shapes here keeps spoofed values out
+  // of the receiver's audit log.
+  let callerDid = null;
+  if (opts.callerDid != null) {
+    const candidate = String(opts.callerDid);
+    if (DID_PATTERN.test(candidate)) callerDid = candidate;
+  }
 
-  const log = root.querySelector('.ow-chat-log');
-  const form = root.querySelector('.ow-chat-form');
-  const input = root.querySelector('.ow-chat-input');
-  const send = root.querySelector('.ow-chat-send');
+  ensureStyles(root.ownerDocument || document, opts.styleNonce);
 
+  // Build DOM via createElement — never via innerHTML. Eliminates the
+  // entire XSS class (no future edit can accidentally interpolate
+  // attacker-controlled HTML) and makes destroy() cleaner.
+  const doc = root.ownerDocument || document;
+  const container = doc.createElement('div');
+  container.className = 'ow-chat';
+
+  const log = doc.createElement('div');
+  log.className = 'ow-chat-log';
+  log.setAttribute('role', 'log');
+  log.setAttribute('aria-live', 'polite');
+  container.appendChild(log);
+
+  const form = doc.createElement('form');
+  form.className = 'ow-chat-form';
+  const input = doc.createElement('input');
+  input.className = 'ow-chat-input';
+  input.type = 'text';
+  input.autocomplete = 'off';
+  input.maxLength = maxMessageLength;
   input.placeholder = placeholder;
+  const send = doc.createElement('button');
+  send.className = 'ow-chat-send';
+  send.type = 'submit';
+  send.textContent = 'Send';
+  form.appendChild(input);
+  form.appendChild(send);
+  container.appendChild(form);
+
+  const meta = doc.createElement('div');
+  meta.className = 'ow-chat-meta';
+  meta.appendChild(doc.createTextNode('Powered by '));
+  const metaLink = doc.createElement('a');
+  metaLink.href = 'https://ownify.ai';
+  metaLink.target = '_blank';
+  metaLink.rel = 'noopener noreferrer';
+  metaLink.textContent = 'ownify';
+  meta.appendChild(metaLink);
+  meta.appendChild(doc.createTextNode(' · agent-to-agent'));
+  container.appendChild(meta);
+
+  // Replace any existing children of root with our container.
+  while (root.firstChild) root.removeChild(root.firstChild);
+  root.appendChild(container);
+  if (root.dataset) root.dataset.ownifyChatInit = '1';
+
   addMsg('agent', greeting);
 
   function addMsg(role, text) {
-    const div = document.createElement('div');
+    const div = doc.createElement('div');
     div.className = 'ow-chat-msg ' + role;
     div.textContent = text;
     log.appendChild(div);
@@ -116,14 +191,33 @@ export function mountOwnifyChat(root, opts) {
     input.disabled = busy;
   }
 
+  // Track in-flight requests so destroy() can abort them and so
+  // closures don't try to mutate detached DOM after teardown.
+  let inflightController = null;
+  let lastSubmitAt = 0;
+  let destroyed = false;
+
   async function onSubmit(e) {
     e.preventDefault();
-    const msg = input.value.trim();
+    if (destroyed) return;
+    const now = Date.now();
+    if (now - lastSubmitAt < submitCooldownMs) return;
+    lastSubmitAt = now;
+
+    let msg = input.value.trim();
     if (!msg) return;
+    if (msg.length > maxMessageLength) msg = msg.slice(0, maxMessageLength);
     input.value = '';
     addMsg('user', msg);
     setBusy(true);
     const pending = addMsg('agent', '…');
+
+    const ac = new AbortController();
+    inflightController = ac;
+    const timer = setTimeout(() => {
+      try { ac.abort(); } catch { /* ignore */ }
+    }, fetchTimeoutMs);
+
     try {
       const headers = {
         'content-type': 'application/json',
@@ -135,25 +229,52 @@ export function mountOwnifyChat(root, opts) {
         method: 'POST',
         headers,
         body: JSON.stringify({ message: msg }),
+        // Public chat is unauth-by-design — never send the visitor's
+        // ownify cookies cross-origin. Operators who need credentials
+        // can mount the widget against a same-origin endpoint where
+        // browser default behaviour applies.
+        credentials: 'omit',
+        signal: ac.signal,
+        redirect: 'error',
       });
+      if (destroyed) return;
       const ct = (r.headers.get('content-type') || '').toLowerCase();
-      const body = ct.indexOf('application/json') !== -1 ? await r.json() : await r.text();
+      const body = ct.includes('application/json') ? await r.json() : await r.text();
+      if (destroyed) return;
       if (!r.ok) {
-        const errMsg = (body && body.error) ? ('error: ' + body.error) : ('http ' + r.status);
+        // Don't render server error bodies verbatim — they may leak
+        // internal state. Log details to the console for the
+        // embedding site's developer; show a generic message to the
+        // visitor.
+        try { console.error('ownify-chat request failed:', r.status, body); } catch { /* ignore */ }
         pending.classList.remove('agent');
         pending.classList.add('error');
-        pending.textContent = errMsg;
+        pending.textContent = 'Something went wrong. Please try again.';
         return;
       }
-      const reply = (body && (body.message || body.reply || body.content || body.text)) || JSON.stringify(body);
-      pending.textContent = reply;
+      const reply = (body && typeof body === 'object'
+        && (body.message || body.reply || body.content || body.text))
+        || (typeof body === 'string' ? body : null);
+      if (typeof reply === 'string' && reply.length > 0) {
+        pending.textContent = reply;
+      } else {
+        try { console.warn('ownify-chat: unexpected response shape', body); } catch { /* ignore */ }
+        pending.textContent = 'Received an unexpected response.';
+      }
     } catch (err) {
+      if (destroyed) return;
+      const aborted = err && (err.name === 'AbortError' || err.message === 'aborted');
+      try { console.error('ownify-chat:', aborted ? 'request timed out' : err); } catch { /* ignore */ }
       pending.classList.remove('agent');
       pending.classList.add('error');
-      pending.textContent = 'network error: ' + (err && err.message ? err.message : 'unknown');
+      pending.textContent = aborted ? 'Request timed out.' : 'Network error. Please try again.';
     } finally {
-      setBusy(false);
-      input.focus();
+      clearTimeout(timer);
+      if (inflightController === ac) inflightController = null;
+      if (!destroyed) {
+        setBusy(false);
+        try { input.focus(); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -161,9 +282,15 @@ export function mountOwnifyChat(root, opts) {
 
   return {
     destroy() {
+      if (destroyed) return;
+      destroyed = true;
       form.removeEventListener('submit', onSubmit);
-      root.innerHTML = '';
-      delete root.dataset.ownifyChatInit;
+      if (inflightController) {
+        try { inflightController.abort(); } catch { /* ignore */ }
+        inflightController = null;
+      }
+      while (root.firstChild) root.removeChild(root.firstChild);
+      if (root.dataset) delete root.dataset.ownifyChatInit;
     },
   };
 }
@@ -177,14 +304,18 @@ export function bootstrapOwnifyChat() {
   const nodes = document.querySelectorAll('[data-ownify-chat], #ownify-chat');
   for (const node of nodes) {
     if (node.dataset.ownifyChatInit === '1') continue;
-    node.dataset.ownifyChatInit = '1';
-    mountOwnifyChat(node, {
-      slug: node.dataset.slug,
-      baseUrl: node.dataset.baseUrl,
-      endpoint: node.dataset.endpoint,
-      greeting: node.dataset.greeting,
-      placeholder: node.dataset.placeholder,
-      callerDid: node.dataset.callerDid,
-    });
+    try {
+      mountOwnifyChat(node, {
+        slug: node.dataset.slug,
+        baseUrl: node.dataset.baseUrl,
+        endpoint: node.dataset.endpoint,
+        greeting: node.dataset.greeting,
+        placeholder: node.dataset.placeholder,
+        callerDid: node.dataset.callerDid,
+        styleNonce: node.dataset.styleNonce,
+      });
+    } catch (err) {
+      try { console.warn('ownify-chat: failed to bootstrap node:', err.message); } catch { /* ignore */ }
+    }
   }
 }

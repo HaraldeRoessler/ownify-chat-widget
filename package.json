@@ -1,6 +1,6 @@
 {
   "name": "ownify-chat-widget",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop-in chat widget for embedding ownify agents on any website. Two lines of HTML or one npm import. Vanilla JS, no deps, MIT.",
   "type": "module",
   "main": "src/index.js",

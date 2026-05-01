@@ -4,6 +4,11 @@
 //
 // For npm/build-system use, import { mountOwnifyChat } from
 // 'ownify-chat-widget' (ESM, src/index.js).
+//
+// NOTE: this file is hand-maintained as a near-mirror of src/index.js.
+// A v0.2 build step will derive it automatically. Until then, fixes
+// MUST be applied to both files; CI / test coverage in this repo is
+// the safety net.
 
 (function () {
   'use strict';
@@ -11,6 +16,12 @@
   var DEFAULT_BASE = 'https://ownify.ai';
   var DEFAULT_GREETING = 'Hi! Ask me anything.';
   var DEFAULT_PLACEHOLDER = 'Type a message…';
+  var DEFAULT_FETCH_TIMEOUT_MS = 30000;
+  var DEFAULT_SUBMIT_COOLDOWN_MS = 500;
+  var MAX_MESSAGE_LENGTH = 4096;
+  var VERSION = '0.1.1';
+
+  var DID_PATTERN = /^did:[a-z0-9]{1,32}:[A-Za-z0-9._-]{1,256}$/;
   var STYLE_ID = 'ownify-chat-widget-styles';
 
   var STYLES = ''
@@ -32,47 +43,96 @@
     + '.ow-chat-meta{font-size:11px;color:var(--ow-meta,#888);text-align:center;padding:8px;border-top:1px solid var(--ow-border,#2a2a2a)}'
     + '.ow-chat-meta a{color:inherit}';
 
-  function ensureStyles() {
+  function ensureStyles(nonce) {
     if (document.getElementById(STYLE_ID)) return;
     var style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = STYLES;
+    if (nonce) style.nonce = String(nonce);
     document.head.appendChild(style);
   }
 
+  function validateEndpoint(urlStr) {
+    try {
+      var u = new URL(urlStr);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+      if (u.username || u.password) return false;
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   function init(root) {
+    var slug = ((root.dataset.slug || '') + '').trim();
+    if (!slug) {
+      try { console.warn('ownify-chat: data-slug attribute required'); } catch (_e) {}
+      return;
+    }
+    var baseUrl = String(root.dataset.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
+    var endpoint = root.dataset.endpoint != null && root.dataset.endpoint !== ''
+      ? String(root.dataset.endpoint)
+      : baseUrl + '/api/chat/' + encodeURIComponent(slug);
+    if (!validateEndpoint(endpoint)) {
+      try { console.warn('ownify-chat: data-endpoint must be a valid http(s) URL'); } catch (_e) {}
+      return;
+    }
+
+    // Mark init AFTER successful validation so a fix-and-rebootstrap
+    // path actually retries this node.
     if (root.dataset.ownifyChatInit === '1') return;
     root.dataset.ownifyChatInit = '1';
 
-    var slug = root.dataset.slug;
-    if (!slug) {
-      console.warn('ownify-chat: data-slug attribute required');
-      return;
+    var greeting = String(root.dataset.greeting || DEFAULT_GREETING);
+    var placeholder = String(root.dataset.placeholder || DEFAULT_PLACEHOLDER);
+    var callerDid = null;
+    if (root.dataset.callerDid != null) {
+      var candidate = String(root.dataset.callerDid);
+      if (DID_PATTERN.test(candidate)) callerDid = candidate;
     }
-    var baseUrl = (root.dataset.baseUrl || DEFAULT_BASE).replace(/\/+$/, '');
-    var endpoint = root.dataset.endpoint || (baseUrl + '/api/chat/' + encodeURIComponent(slug));
-    var greeting = root.dataset.greeting || DEFAULT_GREETING;
-    var placeholder = root.dataset.placeholder || DEFAULT_PLACEHOLDER;
-    var callerDid = root.dataset.callerDid || null;
 
-    ensureStyles();
+    ensureStyles(root.dataset.styleNonce);
 
-    root.innerHTML = ''
-      + '<div class="ow-chat">'
-      + '  <div class="ow-chat-log" role="log" aria-live="polite"></div>'
-      + '  <form class="ow-chat-form">'
-      + '    <input class="ow-chat-input" type="text" autocomplete="off" />'
-      + '    <button class="ow-chat-send" type="submit">Send</button>'
-      + '  </form>'
-      + '  <div class="ow-chat-meta">Powered by <a href="https://ownify.ai" target="_blank" rel="noopener">ownify</a> · agent-to-agent</div>'
-      + '</div>';
+    var container = document.createElement('div');
+    container.className = 'ow-chat';
 
-    var log = root.querySelector('.ow-chat-log');
-    var form = root.querySelector('.ow-chat-form');
-    var input = root.querySelector('.ow-chat-input');
-    var send = root.querySelector('.ow-chat-send');
+    var log = document.createElement('div');
+    log.className = 'ow-chat-log';
+    log.setAttribute('role', 'log');
+    log.setAttribute('aria-live', 'polite');
+    container.appendChild(log);
 
+    var form = document.createElement('form');
+    form.className = 'ow-chat-form';
+    var input = document.createElement('input');
+    input.className = 'ow-chat-input';
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.maxLength = MAX_MESSAGE_LENGTH;
     input.placeholder = placeholder;
+    var send = document.createElement('button');
+    send.className = 'ow-chat-send';
+    send.type = 'submit';
+    send.textContent = 'Send';
+    form.appendChild(input);
+    form.appendChild(send);
+    container.appendChild(form);
+
+    var meta = document.createElement('div');
+    meta.className = 'ow-chat-meta';
+    meta.appendChild(document.createTextNode('Powered by '));
+    var metaLink = document.createElement('a');
+    metaLink.href = 'https://ownify.ai';
+    metaLink.target = '_blank';
+    metaLink.rel = 'noopener noreferrer';
+    metaLink.textContent = 'ownify';
+    meta.appendChild(metaLink);
+    meta.appendChild(document.createTextNode(' · agent-to-agent'));
+    container.appendChild(meta);
+
+    while (root.firstChild) root.removeChild(root.firstChild);
+    root.appendChild(container);
+
     addMsg('agent', greeting);
 
     function addMsg(role, text) {
@@ -89,44 +149,73 @@
       input.disabled = busy;
     }
 
+    var inflightController = null;
+    var lastSubmitAt = 0;
+
     form.addEventListener('submit', async function (e) {
       e.preventDefault();
+      var now = Date.now();
+      if (now - lastSubmitAt < DEFAULT_SUBMIT_COOLDOWN_MS) return;
+      lastSubmitAt = now;
+
       var msg = input.value.trim();
       if (!msg) return;
+      if (msg.length > MAX_MESSAGE_LENGTH) msg = msg.slice(0, MAX_MESSAGE_LENGTH);
       input.value = '';
       addMsg('user', msg);
       setBusy(true);
       var pending = addMsg('agent', '…');
+
+      var ac = new AbortController();
+      inflightController = ac;
+      var timer = setTimeout(function () {
+        try { ac.abort(); } catch (_e) {}
+      }, DEFAULT_FETCH_TIMEOUT_MS);
+
       try {
         var headers = {
           'content-type': 'application/json',
           accept: 'application/json',
-          'x-ownify-client': 'ownify-chat-widget@0.1.0',
+          'x-ownify-client': 'ownify-chat-widget@' + VERSION,
         };
         if (callerDid) headers['x-caller-did'] = callerDid;
         var r = await fetch(endpoint, {
           method: 'POST',
           headers: headers,
           body: JSON.stringify({ message: msg }),
+          credentials: 'omit',
+          signal: ac.signal,
+          redirect: 'error',
         });
         var ct = (r.headers.get('content-type') || '').toLowerCase();
-        var body = ct.indexOf('application/json') !== -1 ? await r.json() : await r.text();
+        var body = ct.includes('application/json') ? await r.json() : await r.text();
         if (!r.ok) {
-          var errMsg = (body && body.error) ? ('error: ' + body.error) : ('http ' + r.status);
+          try { console.error('ownify-chat request failed:', r.status, body); } catch (_e) {}
           pending.classList.remove('agent');
           pending.classList.add('error');
-          pending.textContent = errMsg;
+          pending.textContent = 'Something went wrong. Please try again.';
           return;
         }
-        var reply = (body && (body.message || body.reply || body.content || body.text)) || JSON.stringify(body);
-        pending.textContent = reply;
+        var reply = (body && typeof body === 'object'
+          && (body.message || body.reply || body.content || body.text))
+          || (typeof body === 'string' ? body : null);
+        if (typeof reply === 'string' && reply.length > 0) {
+          pending.textContent = reply;
+        } else {
+          try { console.warn('ownify-chat: unexpected response shape', body); } catch (_e) {}
+          pending.textContent = 'Received an unexpected response.';
+        }
       } catch (err) {
+        var aborted = err && (err.name === 'AbortError' || err.message === 'aborted');
+        try { console.error('ownify-chat:', aborted ? 'request timed out' : err); } catch (_e) {}
         pending.classList.remove('agent');
         pending.classList.add('error');
-        pending.textContent = 'network error: ' + (err && err.message ? err.message : 'unknown');
+        pending.textContent = aborted ? 'Request timed out.' : 'Network error. Please try again.';
       } finally {
+        clearTimeout(timer);
+        if (inflightController === ac) inflightController = null;
         setBusy(false);
-        input.focus();
+        try { input.focus(); } catch (_e) {}
       }
     });
   }
