@@ -1,6 +1,6 @@
 {
   "name": "ownify-chat-widget",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Drop-in chat widget for embedding ownify agents on any website. Two lines of HTML or one npm import. Vanilla JS, no deps, MIT.",
   "type": "module",
   "main": "src/index.js",
@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "test": "node --test --test-force-exit test/*.test.js",
-    "build:standalone": "echo 'standalone is hand-maintained at src/standalone.js — no build step'"
+    "build:standalone": "node scripts/build-standalone.js",
+    "prepack": "node scripts/build-standalone.js"
   },
   "engines": {
     "node": ">=18"

@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.1.2 — 2026-05-01
+
+Second security review pass — two reviewers, the headline issues are
+the build-step gap (drift risk between index.js and standalone.js)
+and several edge-case hardening items.
+
+### Fixed
+
+- **Build step (MED, process)** — `scripts/build-standalone.js`
+  derives `src/standalone.js` from `src/index.js`. Single source of
+  truth: `src/index.js`. The `prepack` hook runs the build before
+  `npm publish`, so the asymmetry that caused the 0.1.1 `destroyed`
+  flag drift cannot recur. Run via `npm run build:standalone`.
+- **Standalone `destroyed` flag drift (LOW)** — closed automatically
+  by the build step; the standalone IIFE now carries the same
+  destroyed-after-await guards that index.js has.
+- **Response size cap (LOW)** — `MAX_REPLY_LENGTH = 10000`. Longer
+  server replies are truncated with `…`. Defends the visitor's
+  browser against a compromised/malicious backend streaming a
+  multi-MB reply that would freeze the tab.
+- **DID regex tightened (LOW)** — method now MUST start with a
+  letter (W3C DID spec), identifier MUST start with an alphanumeric.
+  Prior regex accepted `did:0:abc` and `did:foo:-bar` which no real
+  method spec emits.
+- **`fetchTimeoutMs` upper bound (LOW)** — now bounded to
+  `[1000ms, 300000ms]`. A value like `Number.MAX_VALUE` would
+  silently clamp to `setTimeout`'s ~24-day max and effectively
+  disable the timeout.
+- **`opts.credentials` opt-in (INFO)** — added explicit
+  `'omit'` / `'same-origin'` / `'include'` option. Default stays
+  `'omit'` for cross-origin safety. Misleading 0.1.1 comment about
+  same-origin "browser default behaviour" removed — credentials
+  are now actually configurable.
+- **Browser-side SSRF defence (INFO)** — `validateEndpoint` rejects
+  literal private/loopback hosts (127.x, 10.x, 172.16-31.x,
+  192.168.x, 169.254.x, ::1, localhost). Browser SOP/CORS already
+  blocks response reads, but the request itself was being emitted —
+  useful for service fingerprinting on the visitor's machine.
+- **Server response no longer logged (INFO)** — failed-response
+  console output now includes only the HTTP status, not the body.
+  Other scripts on the embedding page (or a hostile console
+  override) can no longer harvest sensitive error-body content.
+- **Array / null body fallback (INFO)** — `Array.isArray` check
+  added to the agent-reply extractor. Previously an array body
+  hit the "unexpected response" branch despite being structurally
+  valid; now still falls through cleanly.
+- **`opts.greeting` / `placeholder` / `client` type warning (INFO)**
+  — non-string values get a `console.warn` so a `{text: 'hi'}`
+  typo doesn't silently render as `[object Object]`.
+
+### Documentation
+
+- README "Limits" section expanded with reply-length cap, fetch-
+  timeout bounds, credentials override, and the endpoint
+  allowlist's private-IP block.
+- README `data-caller-did` description now explicitly notes that
+  the embedding page can set arbitrary values; the server treats
+  it as audit-only and operators must never trust it for
+  authorization or non-repudiation.
+
+### Out-of-scope (deliberate)
+
+- **Version fingerprinting via `X-Ownify-Client`** — header still
+  includes the exact widget version by default. Operators wanting
+  to suppress can pass `opts.client` (or omit it from the embed).
+  The visibility cost is low compared with the audit value of
+  knowing which client version produced a given session.
+
+### Compatibility
+
+Behavioural changes (all minor):
+- Endpoint URLs pointing at private/loopback IPs are now rejected
+  at construct time. Self-hosted ownify deployments that need a
+  loopback test rig should use a non-IP-literal hostname or a
+  public IP for staging.
+- Server replies longer than 10 000 chars are truncated in the UI.
+  Set `opts.maxMessageLength` higher only if your agent legitimately
+  produces longer single-turn replies.
+- `fetchTimeoutMs > 300_000` falls back to the 30 s default rather
+  than honouring the absurd value.
+
 ## 0.1.1 — 2026-05-01
 
 First security review pass — two reviewers, ~14 unique findings

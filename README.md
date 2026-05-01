@@ -38,7 +38,7 @@ Optional `data-*` attributes:
 - `data-placeholder` — input placeholder text
 - `data-base-url` — override the host (default: `https://ownify.ai`)
 - `data-endpoint` — override the full POST URL (validated as http/https, embedded credentials rejected)
-- `data-caller-did` — optional `X-Caller-DID` header (shape-validated against `did:method:id` pattern; audit-only, no auth)
+- `data-caller-did` — optional `X-Caller-DID` header (shape-validated against `did:method:id` pattern; **audit-only, can be set by the embedding page — never trust it for authorization or non-repudiation**)
 - `data-style-nonce` — CSP nonce for the injected `<style>` tag (see "CSP" below)
 
 ### Step 2b — npm package (for React / Vue / Svelte / build pipelines)
@@ -94,12 +94,22 @@ Or via the npm API: `mountOwnifyChat(root, { slug, styleNonce })`.
 
 - **Message length**: 4096 characters per message. Longer input is
   truncated client-side; the server applies its own 64 KiB body cap.
+- **Reply length displayed**: 10 000 characters. Longer replies are
+  truncated with `…` so a malicious / compromised backend can't
+  freeze the visitor's tab with a multi-MB stream.
 - **Submit cooldown**: 500 ms between consecutive sends.
 - **Fetch timeout**: 30 s per request — aborts and surfaces as
-  "Request timed out." in the chat.
+  "Request timed out." in the chat. Bounded to `[1 s, 5 min]`.
+- **Credentials**: `'omit'` by default (cookies don't travel
+  cross-origin). Override via `opts.credentials` if you self-host
+  on a same-origin domain that needs an authenticated chat surface.
+- **Endpoint allowlist**: only `http://` and `https://` URLs without
+  embedded credentials. Private/loopback IP literals are rejected
+  (browser-side defence-in-depth — even though browser SOP usually
+  blocks the response, the request itself doesn't fire).
 
-All three are configurable via `mountOwnifyChat(root, { fetchTimeoutMs,
-submitCooldownMs, maxMessageLength })`.
+All limits are configurable via `mountOwnifyChat(root, { fetchTimeoutMs,
+submitCooldownMs, maxMessageLength, credentials })`.
 
 ## Self-hosted ownify deployments
 

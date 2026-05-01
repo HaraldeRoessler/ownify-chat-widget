@@ -16,15 +16,27 @@ const DEFAULT_BASE_URL = 'https://ownify.ai';
 const DEFAULT_GREETING = 'Hi! Ask me anything.';
 const DEFAULT_PLACEHOLDER = 'Type a message…';
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const MIN_FETCH_TIMEOUT_MS = 1_000;
+const MAX_FETCH_TIMEOUT_MS = 5 * 60_000;     // 5 min hard ceiling
 const DEFAULT_SUBMIT_COOLDOWN_MS = 500;
 const MAX_MESSAGE_LENGTH = 4096;
-const VERSION = '0.1.1';
+const MAX_REPLY_LENGTH = 10_000;             // truncate server replies past this
+const VERSION = '0.1.2';
 
-// Same shape the receiver-side library validates against. Audit-only
-// header — the server never trusts it for authorization, but we
-// shape-validate before forwarding to avoid spoofing arbitrary
-// values into the receiver's audit log.
-const DID_PATTERN = /^did:[a-z0-9]{1,32}:[A-Za-z0-9._-]{1,256}$/;
+// Tightened from 0.1.1: method MUST start with a letter (W3C DID
+// spec); identifier MUST start with an alphanumeric (forbidden
+// `-foo` / `.foo` shapes some method specs reject anyway). Audit-only
+// signal server-side; rejecting bad shapes here keeps spoofed values
+// out of the receiver's audit log.
+const DID_PATTERN = /^did:[a-z][a-z0-9]{0,31}:[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
+
+// Browser-side SSRF defence: if a malicious embedding page sets
+// data-endpoint to a private/loopback host, the visitor's browser
+// would attempt the request. Browser SOP / CORS usually blocks the
+// response, but we'd still emit the request — useful for service
+// fingerprinting on the visitor's machine. Block obvious literals.
+const PRIVATE_HOST_PATTERN = /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0$|::1$|localhost$|localhost\.localdomain$)/i;
+const PRIVATE_V4_172 = /^172\.(1[6-9]|2[0-9]|3[01])\./;
 
 const STYLE_ID = 'ownify-chat-widget-styles';
 const STYLES = ''
@@ -58,14 +70,18 @@ function ensureStyles(doc, nonce) {
 }
 
 // Validate an endpoint URL. Rejects non-http(s), embedded credentials,
-// and any URL that fails to parse. Defends against an attacker who
-// can clobber data-endpoint on the mount node redirecting messages
-// to a phishing endpoint.
+// private/loopback IP literals, and any URL that fails to parse.
+// Defends against an attacker who can clobber data-endpoint on the
+// mount node — either redirecting messages to a phishing endpoint
+// or pointing at the visitor's local services for fingerprinting.
 function validateEndpoint(urlStr) {
   let u;
   try { u = new URL(urlStr); } catch { return false; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
   if (u.username || u.password) return false;
+  const host = u.hostname.toLowerCase();
+  if (PRIVATE_HOST_PATTERN.test(host)) return false;
+  if (PRIVATE_V4_172.test(host)) return false;
   return true;
 }
 
@@ -108,15 +124,35 @@ export function mountOwnifyChat(root, opts) {
     throw new Error('mountOwnifyChat: endpoint must be a valid http(s) URL without embedded credentials');
   }
 
+  // Warn loudly when callers pass non-strings to user-visible
+  // options — easier to catch a `{text: 'hi'}` typo than to debug
+  // why "[object Object]" is rendered in the chat.
+  for (const k of ['greeting', 'placeholder', 'client']) {
+    if (opts[k] != null && typeof opts[k] !== 'string') {
+      try { console.warn('ownify-chat: opts.' + k + ' should be a string, got ' + typeof opts[k]); } catch { /* ignore */ }
+    }
+  }
   const greeting = String(opts.greeting || DEFAULT_GREETING);
   const placeholder = String(opts.placeholder || DEFAULT_PLACEHOLDER);
   const client = String(opts.client || ('ownify-chat-widget@' + VERSION));
-  const fetchTimeoutMs = Number.isFinite(opts.fetchTimeoutMs) && opts.fetchTimeoutMs > 0
+  // Bound fetchTimeoutMs to a sane window: a value like Number.MAX_VALUE
+  // would silently clamp to setTimeout's ~24-day max and effectively
+  // disable the timeout. 1s minimum (sub-1s is a clock-skew bug),
+  // 5min ceiling (longer is almost never legitimate for chat).
+  const fetchTimeoutMs = Number.isFinite(opts.fetchTimeoutMs)
+    && opts.fetchTimeoutMs >= MIN_FETCH_TIMEOUT_MS
+    && opts.fetchTimeoutMs <= MAX_FETCH_TIMEOUT_MS
     ? opts.fetchTimeoutMs : DEFAULT_FETCH_TIMEOUT_MS;
   const submitCooldownMs = Number.isFinite(opts.submitCooldownMs) && opts.submitCooldownMs >= 0
     ? opts.submitCooldownMs : DEFAULT_SUBMIT_COOLDOWN_MS;
   const maxMessageLength = Number.isInteger(opts.maxMessageLength) && opts.maxMessageLength > 0
     ? opts.maxMessageLength : MAX_MESSAGE_LENGTH;
+  // credentials: opt-in, default 'omit'. Public chat is unauth-by-design,
+  // so cookies don't travel to the chat endpoint. Operators with a
+  // same-origin / authenticated chat backend can pass 'same-origin'
+  // or 'include' explicitly.
+  const credentials = ['omit', 'same-origin', 'include'].includes(opts.credentials)
+    ? opts.credentials : 'omit';
 
   // Validate caller DID shape before forwarding. Audit-only signal
   // server-side; rejecting bad shapes here keeps spoofed values out
@@ -229,11 +265,7 @@ export function mountOwnifyChat(root, opts) {
         method: 'POST',
         headers,
         body: JSON.stringify({ message: msg }),
-        // Public chat is unauth-by-design — never send the visitor's
-        // ownify cookies cross-origin. Operators who need credentials
-        // can mount the widget against a same-origin endpoint where
-        // browser default behaviour applies.
-        credentials: 'omit',
+        credentials,
         signal: ac.signal,
         redirect: 'error',
       });
@@ -243,22 +275,29 @@ export function mountOwnifyChat(root, opts) {
       if (destroyed) return;
       if (!r.ok) {
         // Don't render server error bodies verbatim — they may leak
-        // internal state. Log details to the console for the
-        // embedding site's developer; show a generic message to the
-        // visitor.
-        try { console.error('ownify-chat request failed:', r.status, body); } catch { /* ignore */ }
+        // internal state. Don't log them to console either — any
+        // other script on the embedding page can read the console
+        // (e.g. by replacing console.error). Log only the status.
+        try { console.error('ownify-chat request failed: HTTP ' + r.status); } catch { /* ignore */ }
         pending.classList.remove('agent');
         pending.classList.add('error');
         pending.textContent = 'Something went wrong. Please try again.';
         return;
       }
-      const reply = (body && typeof body === 'object'
+      // Pull the agent's reply out of the response. Reject arrays
+      // (response is a single message, not a sequence) and null.
+      const reply = (body && typeof body === 'object' && !Array.isArray(body)
         && (body.message || body.reply || body.content || body.text))
         || (typeof body === 'string' ? body : null);
       if (typeof reply === 'string' && reply.length > 0) {
-        pending.textContent = reply;
+        // Cap rendered reply size — defends the visitor's browser
+        // against a malicious / compromised backend streaming a
+        // huge reply that would freeze the tab.
+        pending.textContent = reply.length > MAX_REPLY_LENGTH
+          ? reply.slice(0, MAX_REPLY_LENGTH) + '…'
+          : reply;
       } else {
-        try { console.warn('ownify-chat: unexpected response shape', body); } catch { /* ignore */ }
+        try { console.warn('ownify-chat: unexpected response shape (logged length only):', typeof body, (body && body.length) || 0); } catch { /* ignore */ }
         pending.textContent = 'Received an unexpected response.';
       }
     } catch (err) {
