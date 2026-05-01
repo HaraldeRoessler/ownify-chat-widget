@@ -55,13 +55,26 @@ const out = `// AUTO-GENERATED from src/index.js by scripts/build-standalone.js
 (function () {
   'use strict';
 
+  // Capture the script tag's CSP nonce at IIFE entry — by the time
+  // DOMContentLoaded fires, document.currentScript is null. If the
+  // embedding page loaded the script with a nonce (e.g. <script
+  // src=".../chat-widget.js" nonce="abc123">), that nonce gets
+  // propagated to every widget mount's injected <style> tag without
+  // the embedder having to duplicate it on every mount node.
+  var __OWNIFY_DEFAULT_STYLE_NONCE = (typeof document !== 'undefined'
+    && document.currentScript
+    && document.currentScript.nonce) || null;
+
 ${stripped}
   // Auto-bootstrap on DOMContentLoaded so a plain <script> tag works
   // without any inline call-out from the embedding page.
+  function __ownifyBootstrap() {
+    bootstrapOwnifyChat({ styleNonce: __OWNIFY_DEFAULT_STYLE_NONCE });
+  }
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', bootstrapOwnifyChat);
+    document.addEventListener('DOMContentLoaded', __ownifyBootstrap);
   } else {
-    bootstrapOwnifyChat();
+    __ownifyBootstrap();
   }
 })();
 `;

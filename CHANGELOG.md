@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.1.3 — 2026-05-01
+
+Third security review pass — two reviewers, ~12 unique findings
+(one MED, several LOW URL-validation edge cases, INFO niceties).
+
+### Fixed
+
+- **Error-body DoS (MED)** — response status is now checked BEFORE
+  parsing the body. On non-2xx, the body stream is cancelled via
+  `r.body.cancel()` rather than awaited via `r.json()` / `r.text()`.
+  Defends against a malicious / compromised backend returning
+  HTTP 500 with a multi-MB JSON payload that would freeze the
+  visitor's tab.
+- **URL validation hardening (LOW × 5)** — comprehensive
+  expansion of `validateEndpoint`:
+  - IPv4-mapped IPv6 loopback / RFC1918 / link-local
+    (`::ffff:127.x`, `::ffff:10.x`, `::ffff:192.168.x`,
+    `::ffff:169.254.x`, `::ffff:172.16-31.x`)
+  - IPv6 unspecified `::` and expanded forms
+    `0:0:0:0:0:0:0:0` / `0:0:0:0:0:0:0:1`
+  - IPv6 `fc00::/7` ULA + `fe80::/10` link-local
+  - Trailing-dot hostname normalisation (`localhost.` matches `localhost`)
+  - Pure-numeric / hex hostnames (`2130706433`, `0x7f000001`)
+  - Additional DNS loopback names: `ip6-localhost`, `ip6-loopback`
+- **Referer leak (LOW)** — `referrerPolicy: 'no-referrer'` on the
+  fetch. Embedding page's URL no longer travels to the chat
+  endpoint with every message.
+- **Standalone cleanup API (LOW)** — `mountOwnifyChat` attaches
+  `_ownifyDestroy` on the mount node so SPA hosts can tear down
+  before removing the container. Documented in README. Standalone
+  IIFE consumers were missing this entirely; npm consumers can also
+  use it instead of holding the return-value handle.
+- **Network-error console leak (LOW)** — `console.error` for
+  network errors logs only `err.name` instead of the full error
+  object. Consistent with the HTTP-error path that already only
+  logs the status code. Prevents stack-trace harvesting by a
+  console-overriding script on the embedding page.
+- **`data-credentials` not wired in bootstrap (INFO)** — fixed.
+  Setting `data-credentials="same-origin"` on the mount node now
+  works, validated by the existing `['omit','same-origin','include']`
+  allowlist in `mountOwnifyChat`.
+- **CSP nonce auto-inheritance for standalone (INFO)** — the
+  build script captures `document.currentScript.nonce` at IIFE
+  entry and forwards it as the default `styleNonce` for every
+  bootstrapped node. Embedders no longer need to duplicate the
+  nonce on every `<div data-ownify-chat>`; the nonce on the
+  `<script>` tag is enough.
+
+### Compatibility
+
+Behavioural changes (all minor):
+- Endpoint URLs pointing at IPv4-mapped IPv6 / IPv6 ULA + link-local
+  / numeric hostnames / trailing-dot loopback variants are now
+  rejected. Self-hosted ownify deployments on IPv6 ULA addresses
+  should use a hostname instead.
+- HTTP error responses are no longer parsed; the visitor sees a
+  generic "Something went wrong" regardless of body content. (Body
+  was already not rendered to the user, but it was still parsed
+  into memory.)
+- `Referer` header is no longer sent to the chat endpoint.
+  Operators relying on Referer for analytics need to reverse-proxy
+  and inject it themselves.
+
 ## 0.1.2 — 2026-05-01
 
 Second security review pass — two reviewers, the headline issues are

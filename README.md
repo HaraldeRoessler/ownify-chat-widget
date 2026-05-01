@@ -41,6 +41,25 @@ Optional `data-*` attributes:
 - `data-caller-did` — optional `X-Caller-DID` header (shape-validated against `did:method:id` pattern; **audit-only, can be set by the embedding page — never trust it for authorization or non-repudiation**)
 - `data-style-nonce` — CSP nonce for the injected `<style>` tag (see "CSP" below)
 
+### SPA cleanup hook
+
+If your site is a single-page app and you mount/unmount the widget
+across routes, call `_ownifyDestroy()` on the mount node before
+removing it from the DOM:
+
+```js
+const root = document.getElementById('chat-root');
+// ...later, on route change...
+if (typeof root._ownifyDestroy === 'function') root._ownifyDestroy();
+root.remove();
+```
+
+This aborts in-flight requests, removes the submit listener, and
+clears the dataset flag so a fresh mount on a new node works
+cleanly. The same handle is returned from `mountOwnifyChat(root,
+opts)` for npm consumers — `const handle = mountOwnifyChat(...);
+handle.destroy();`.
+
 ### Step 2b — npm package (for React / Vue / Svelte / build pipelines)
 
 ```sh
@@ -89,6 +108,15 @@ matching your `style-src 'nonce-...'` directive:
 ```
 
 Or via the npm API: `mountOwnifyChat(root, { slug, styleNonce })`.
+
+If you load the standalone with a CSP nonce on the script tag itself,
+the widget reads `document.currentScript.nonce` and uses it
+automatically — no per-mount-node attribute needed:
+
+```html
+<script src="https://ownify.ai/chat-widget.js" nonce="<your-csp-nonce>" defer></script>
+<div data-ownify-chat data-slug="your-tenant"></div>
+```
 
 ## Limits
 

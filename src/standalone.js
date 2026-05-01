@@ -11,6 +11,16 @@
 (function () {
   'use strict';
 
+  // Capture the script tag's CSP nonce at IIFE entry — by the time
+  // DOMContentLoaded fires, document.currentScript is null. If the
+  // embedding page loaded the script with a nonce (e.g. <script
+  // src=".../chat-widget.js" nonce="abc123">), that nonce gets
+  // propagated to every widget mount's injected <style> tag without
+  // the embedder having to duplicate it on every mount node.
+  var __OWNIFY_DEFAULT_STYLE_NONCE = (typeof document !== 'undefined'
+    && document.currentScript
+    && document.currentScript.nonce) || null;
+
 // ownify-chat-widget — programmatic API for build-system users.
 //
 // Two ways to use the widget:
@@ -34,7 +44,7 @@ const MAX_FETCH_TIMEOUT_MS = 5 * 60_000;     // 5 min hard ceiling
 const DEFAULT_SUBMIT_COOLDOWN_MS = 500;
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_REPLY_LENGTH = 10_000;             // truncate server replies past this
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 
 // Tightened from 0.1.1: method MUST start with a letter (W3C DID
 // spec); identifier MUST start with an alphanumeric (forbidden
@@ -43,13 +53,44 @@ const VERSION = '0.1.2';
 // out of the receiver's audit log.
 const DID_PATTERN = /^did:[a-z][a-z0-9]{0,31}:[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
 
-// Browser-side SSRF defence: if a malicious embedding page sets
+// Browser-side SSRF defence. If a malicious embedding page sets
 // data-endpoint to a private/loopback host, the visitor's browser
-// would attempt the request. Browser SOP / CORS usually blocks the
-// response, but we'd still emit the request — useful for service
-// fingerprinting on the visitor's machine. Block obvious literals.
-const PRIVATE_HOST_PATTERN = /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0$|::1$|localhost$|localhost\.localdomain$)/i;
+// would emit the request — even if SOP/CORS blocks reading the
+// response, the bare request is useful for service-fingerprinting
+// on the visitor's machine. Block IPv4 + IPv6 literal forms,
+// IPv4-mapped IPv6, IPv6 link-local + ULA, the most common DNS
+// loopback names, and pure-numeric hostnames (decimal/hex IP
+// notation). Trailing dots get stripped before matching.
+const PRIVATE_HOST_PATTERN = new RegExp(
+  '^(?:'
+  + '127\\.'                                  // 127.0.0.0/8 IPv4 loopback
+  + '|10\\.'                                  // 10.0.0.0/8 RFC1918
+  + '|192\\.168\\.'                           // 192.168/16 RFC1918
+  + '|169\\.254\\.'                           // 169.254/16 link-local + cloud metadata
+  + '|0\\.0\\.0\\.0$'                         // unspecified
+  + '|::$'                                    // IPv6 unspecified
+  + '|::1$'                                   // IPv6 loopback (compressed)
+  + '|0:0:0:0:0:0:0:0$'                       // IPv6 unspecified (expanded)
+  + '|0:0:0:0:0:0:0:1$'                       // IPv6 loopback (expanded)
+  + '|::ffff:127\\.'                          // IPv4-mapped IPv6 loopback
+  + '|::ffff:10\\.'                           // IPv4-mapped IPv6 RFC1918
+  + '|::ffff:192\\.168\\.'                    // IPv4-mapped IPv6 RFC1918
+  + '|::ffff:169\\.254\\.'                    // IPv4-mapped IPv6 link-local
+  + '|localhost$'                             // DNS loopback
+  + '|localhost\\.localdomain$'               // DNS loopback (BSD/RHEL)
+  + '|ip6-localhost$'                         // DNS loopback (IPv6)
+  + '|ip6-loopback$'
+  + ')',
+  'i'
+);
 const PRIVATE_V4_172 = /^172\.(1[6-9]|2[0-9]|3[01])\./;
+const PRIVATE_V6_FC00 = /^f[cd][0-9a-f]*:/i;          // fc00::/7 unique-local IPv6
+const PRIVATE_V6_FE80 = /^fe[89ab][0-9a-f]*:/i;       // fe80::/10 link-local IPv6
+const PRIVATE_V6_V4_MAPPED_172 = /^::ffff:172\.(1[6-9]|2[0-9]|3[01])\./;
+// Pure-numeric / hex hostname → almost certainly a non-canonical IP
+// encoding (decimal `2130706433` = 127.0.0.1, hex `0x7f000001` = same).
+// Browsers resolve these to the underlying IP; reject as a class.
+const NUMERIC_HOSTNAME = /^(?:\d+|0x[0-9a-f]+)$/i;
 
 const STYLE_ID = 'ownify-chat-widget-styles';
 const STYLES = ''
@@ -92,9 +133,15 @@ function validateEndpoint(urlStr) {
   try { u = new URL(urlStr); } catch { return false; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
   if (u.username || u.password) return false;
-  const host = u.hostname.toLowerCase();
+  // Strip trailing dot (e.g. `localhost.` resolves identically to
+  // `localhost` in browsers) before matching.
+  const host = u.hostname.toLowerCase().replace(/\.$/, '');
+  if (NUMERIC_HOSTNAME.test(host)) return false;
   if (PRIVATE_HOST_PATTERN.test(host)) return false;
   if (PRIVATE_V4_172.test(host)) return false;
+  if (PRIVATE_V6_FC00.test(host)) return false;
+  if (PRIVATE_V6_FE80.test(host)) return false;
+  if (PRIVATE_V6_V4_MAPPED_172.test(host)) return false;
   return true;
 }
 
@@ -281,22 +328,27 @@ function mountOwnifyChat(root, opts) {
         credentials,
         signal: ac.signal,
         redirect: 'error',
+        // Don't leak the embedding page's URL/path/query to the chat
+        // endpoint via Referer. Operators who need referrer for
+        // analytics can reverse-proxy and add their own.
+        referrerPolicy: 'no-referrer',
       });
       if (destroyed) return;
-      const ct = (r.headers.get('content-type') || '').toLowerCase();
-      const body = ct.includes('application/json') ? await r.json() : await r.text();
-      if (destroyed) return;
+      // Check status BEFORE parsing the body. A malicious / compromised
+      // backend returning HTTP 500 with a multi-MB JSON payload would
+      // freeze the visitor's tab if we await r.json() unconditionally.
+      // Cancel the body stream on error so we never read it into memory.
       if (!r.ok) {
-        // Don't render server error bodies verbatim — they may leak
-        // internal state. Don't log them to console either — any
-        // other script on the embedding page can read the console
-        // (e.g. by replacing console.error). Log only the status.
+        try { if (r.body && r.body.cancel) r.body.cancel(); } catch { /* ignore */ }
         try { console.error('ownify-chat request failed: HTTP ' + r.status); } catch { /* ignore */ }
         pending.classList.remove('agent');
         pending.classList.add('error');
         pending.textContent = 'Something went wrong. Please try again.';
         return;
       }
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      const body = ct.includes('application/json') ? await r.json() : await r.text();
+      if (destroyed) return;
       // Pull the agent's reply out of the response. Reject arrays
       // (response is a single message, not a sequence) and null.
       const reply = (body && typeof body === 'object' && !Array.isArray(body)
@@ -316,7 +368,11 @@ function mountOwnifyChat(root, opts) {
     } catch (err) {
       if (destroyed) return;
       const aborted = err && (err.name === 'AbortError' || err.message === 'aborted');
-      try { console.error('ownify-chat:', aborted ? 'request timed out' : err); } catch { /* ignore */ }
+      // Log only err.name (consistent with the HTTP-error path that
+      // logs only the status). Avoids handing the full error object —
+      // including its stack trace — to a console-overriding script
+      // on the embedding page.
+      try { console.error('ownify-chat:', aborted ? 'request timed out' : 'network error: ' + (err && err.name)); } catch { /* ignore */ }
       pending.classList.remove('agent');
       pending.classList.add('error');
       pending.textContent = aborted ? 'Request timed out.' : 'Network error. Please try again.';
@@ -332,27 +388,43 @@ function mountOwnifyChat(root, opts) {
 
   form.addEventListener('submit', onSubmit);
 
-  return {
-    destroy() {
-      if (destroyed) return;
-      destroyed = true;
-      form.removeEventListener('submit', onSubmit);
-      if (inflightController) {
-        try { inflightController.abort(); } catch { /* ignore */ }
-        inflightController = null;
-      }
-      while (root.firstChild) root.removeChild(root.firstChild);
-      if (root.dataset) delete root.dataset.ownifyChatInit;
-    },
-  };
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    form.removeEventListener('submit', onSubmit);
+    if (inflightController) {
+      try { inflightController.abort(); } catch { /* ignore */ }
+      inflightController = null;
+    }
+    while (root.firstChild) root.removeChild(root.firstChild);
+    if (root.dataset) delete root.dataset.ownifyChatInit;
+    // Remove the cleanup hook we attached for SPA hosts.
+    try { if (root._ownifyDestroy === destroy) delete root._ownifyDestroy; } catch { /* ignore */ }
+  }
+
+  // SPA-host cleanup hook. Standalone-IIFE consumers (script-tag
+  // embeds) don't get the return value, so attach the destroy handle
+  // to the mount node where they can find it. Documented in README.
+  try { root._ownifyDestroy = destroy; } catch { /* ignore */ }
+
+  return { destroy };
 }
 
 /**
  * Auto-bootstrap any element on the page with [data-ownify-chat] or
  * id="ownify-chat". Useful for non-build pages — but most of those
  * use the standalone <script> tag instead, which calls this on load.
+ *
+ * @param {object} [defaults]
+ *   @param {string} [defaults.styleNonce] — used when the node
+ *     itself doesn't carry data-style-nonce. Standalone bootstrap
+ *     auto-fills this with document.currentScript.nonce so a CSP
+ *     nonce on the <script> tag transparently propagates to the
+ *     widget's inline <style> without the embedder having to
+ *     duplicate the nonce on every mount node.
  */
-function bootstrapOwnifyChat() {
+function bootstrapOwnifyChat(defaults) {
+  const opts = defaults && typeof defaults === 'object' ? defaults : {};
   const nodes = document.querySelectorAll('[data-ownify-chat], #ownify-chat');
   for (const node of nodes) {
     if (node.dataset.ownifyChatInit === '1') continue;
@@ -364,19 +436,26 @@ function bootstrapOwnifyChat() {
         greeting: node.dataset.greeting,
         placeholder: node.dataset.placeholder,
         callerDid: node.dataset.callerDid,
-        styleNonce: node.dataset.styleNonce,
+        // Per-node attribute wins; fall back to the default the
+        // standalone bootstrap captured from <script nonce="...">
+        styleNonce: node.dataset.styleNonce || opts.styleNonce,
+        // data-credentials wasn't wired in 0.1.2 — fixed.
+        credentials: node.dataset.credentials,
       });
     } catch (err) {
-      try { console.warn('ownify-chat: failed to bootstrap node:', err.message); } catch { /* ignore */ }
+      try { console.warn('ownify-chat: failed to bootstrap node:', err && err.message); } catch { /* ignore */ }
     }
   }
 }
 
   // Auto-bootstrap on DOMContentLoaded so a plain <script> tag works
   // without any inline call-out from the embedding page.
+  function __ownifyBootstrap() {
+    bootstrapOwnifyChat({ styleNonce: __OWNIFY_DEFAULT_STYLE_NONCE });
+  }
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', bootstrapOwnifyChat);
+    document.addEventListener('DOMContentLoaded', __ownifyBootstrap);
   } else {
-    bootstrapOwnifyChat();
+    __ownifyBootstrap();
   }
 })();
