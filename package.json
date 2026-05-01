@@ -1,0 +1,45 @@
+{
+  "name": "ownify-chat-widget",
+  "version": "0.1.0",
+  "description": "Drop-in chat widget for embedding ownify agents on any website. Two lines of HTML or one npm import. Vanilla JS, no deps, MIT.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./standalone": "./src/standalone.js"
+  },
+  "files": [
+    "src/**/*.js",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test --test-force-exit test/*.test.js",
+    "build:standalone": "echo 'standalone is hand-maintained at src/standalone.js — no build step'"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ownify",
+    "chat-widget",
+    "embeddable",
+    "agent",
+    "agent-web",
+    "vanilla-js"
+  ],
+  "author": "Harald Roessler",
+  "license": "MIT",
+  "homepage": "https://github.com/HaraldeRoessler/ownify-chat-widget",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaraldeRoessler/ownify-chat-widget.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HaraldeRoessler/ownify-chat-widget/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
