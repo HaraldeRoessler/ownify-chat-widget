@@ -87,7 +87,37 @@ const STYLES = ''
   + 'padding:8px 16px;font-size:14px;font-weight:500;cursor:pointer}'
   + '.ow-chat-send:disabled{opacity:0.5;cursor:wait}'
   + '.ow-chat-meta{font-size:11px;color:var(--ow-meta,#888);text-align:center;padding:8px;border-top:1px solid var(--ow-border,#2a2a2a)}'
-  + '.ow-chat-meta a{color:inherit}';
+  + '.ow-chat-meta a{color:inherit}'
+  // Markdown rendering inside agent bubbles. white-space:pre-wrap on
+  // .ow-chat-msg means literal newlines get rendered as breaks already;
+  // these rules give the parsed markdown elements sensible spacing
+  // without pulling in a stylesheet's worth of opinions.
+  + '.ow-chat-msg p{margin:0 0 0.5em 0}'
+  + '.ow-chat-msg p:last-child{margin-bottom:0}'
+  + '.ow-chat-msg h1,.ow-chat-msg h2,.ow-chat-msg h3,.ow-chat-msg h4,.ow-chat-msg h5,.ow-chat-msg h6{margin:0.6em 0 0.3em 0;font-size:1.05em;font-weight:600}'
+  + '.ow-chat-msg h1:first-child,.ow-chat-msg h2:first-child,.ow-chat-msg h3:first-child{margin-top:0}'
+  + '.ow-chat-msg ul,.ow-chat-msg ol{margin:0.3em 0 0.5em 0;padding-left:1.4em}'
+  + '.ow-chat-msg li{margin:0.15em 0}'
+  + '.ow-chat-msg blockquote{margin:0.3em 0;padding:0 0 0 0.8em;border-left:3px solid var(--ow-border,#2a2a2a);color:var(--ow-meta,#888)}'
+  + '.ow-chat-msg code{background:rgba(127,127,127,0.18);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.92em}'
+  + '.ow-chat-msg pre{background:rgba(127,127,127,0.12);padding:8px 10px;border-radius:6px;overflow-x:auto;margin:0.4em 0;white-space:pre}'
+  + '.ow-chat-msg pre code{background:transparent;padding:0;font-size:0.85em}'
+  + '.ow-chat-msg a{color:var(--ow-link,#5da7ff);text-decoration:underline}'
+  + '.ow-chat-msg strong{font-weight:600}'
+  + '.ow-chat-msg em{font-style:italic}'
+  + '.ow-chat-msg table{border-collapse:collapse;margin:0.4em 0;font-size:0.92em;display:block;max-width:100%;overflow-x:auto}'
+  + '.ow-chat-msg th,.ow-chat-msg td{border:1px solid var(--ow-border,#2a2a2a);padding:4px 9px;text-align:left;vertical-align:top}'
+  + '.ow-chat-msg th{background:rgba(127,127,127,0.12);font-weight:600}'
+  + '.ow-chat-msg tbody tr:nth-child(even) td{background:rgba(127,127,127,0.04)}'
+  // Typing indicator: three bouncing dots while a reply is in flight.
+  // Animation is opacity-only on a fixed transform so layout doesn\'t
+  // shift, and uses prefers-reduced-motion friendly behaviour by
+  // staying within the bubble\'s natural height.
+  + '.ow-chat-msg.ow-chat-typing{padding:10px 14px;display:inline-flex;align-items:center;gap:4px}'
+  + '.ow-chat-typing-dot{display:inline-block;width:6px;height:6px;background:var(--ow-fg,#bbb);border-radius:50%;opacity:0.35;animation:ow-chat-typing-anim 1.2s ease-in-out infinite}'
+  + '.ow-chat-typing-dot:nth-child(2){animation-delay:0.18s}'
+  + '.ow-chat-typing-dot:nth-child(3){animation-delay:0.36s}'
+  + '@keyframes ow-chat-typing-anim{0%,80%,100%{opacity:0.25}40%{opacity:1}}';
 
 function ensureStyles(doc, nonce) {
   if (doc.getElementById(STYLE_ID)) return;
@@ -141,6 +171,240 @@ function validateEndpoint(urlStr) {
  *
  * @returns {{ destroy: () => void }}
  */
+// ── Safe-by-construction markdown renderer ────────────────────────────────
+// Subset supported: paragraphs, line breaks, **bold**, *italic*, `code`,
+// fenced ```code blocks```, # ## ### headings, - bullet lists, 1. ordered
+// lists, > blockquotes, [text](url). Output uses createElement +
+// textContent only — never innerHTML, no eval, no DOM-from-string. URLs
+// in links are restricted to http(s) + relative; anything else degrades
+// to plain text. Safe to feed adversarial agent output.
+const MD_INLINE_SPECIALS = '`*_[';
+function renderMarkdownSafe(src, container) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  if (typeof src !== 'string' || src.length === 0) return;
+  const lines = src.split('\n');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // Fenced code block
+    if (/^\s*```/.test(line)) {
+      const lang = line.replace(/^\s*```/, '').trim();
+      i++;
+      const buf = [];
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++; }
+      if (i < lines.length) i++;
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      if (lang && /^[a-zA-Z0-9_-]{1,32}$/.test(lang)) code.dataset.lang = lang;
+      code.textContent = buf.join('\n');
+      pre.appendChild(code);
+      container.appendChild(pre);
+      continue;
+    }
+    // Table: detect a `|`-leading row whose successor is a separator
+    // line (`|---|---|` or `| --- | :--: |` etc). Without this, a
+    // multi-line markdown table gets collapsed into a single paragraph
+    // because each `| ... |` line wasn\'t recognised as a block-break.
+    if (/^\s*\|/.test(line) && i + 1 < lines.length
+        && /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+      const splitRow = (raw) => {
+        const trimmed = raw.replace(/^\s*\|/, '').replace(/\|\s*$/, '');
+        return trimmed.split('|').map((c) => c.trim());
+      };
+      const headerCells = splitRow(line);
+      i += 2; // header + separator
+      const dataRows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        dataRows.push(splitRow(lines[i]));
+        i++;
+      }
+      const tbl = document.createElement('table');
+      const thead = document.createElement('thead');
+      const trH = document.createElement('tr');
+      for (const cell of headerCells) {
+        const th = document.createElement('th');
+        _renderInlineMd(cell, th);
+        trH.appendChild(th);
+      }
+      thead.appendChild(trH);
+      tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      for (const row of dataRows) {
+        const tr = document.createElement('tr');
+        // pad / truncate to header width so a malformed row doesn\'t
+        // produce an uneven table
+        const cols = row.length === headerCells.length
+          ? row
+          : row.slice(0, headerCells.length).concat(
+              new Array(Math.max(0, headerCells.length - row.length)).fill(''));
+        for (const cell of cols) {
+          const td = document.createElement('td');
+          _renderInlineMd(cell, td);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      tbl.appendChild(tbody);
+      container.appendChild(tbl);
+      continue;
+    }
+    // Heading
+    const h = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (h) {
+      const node = document.createElement('h' + h[1].length);
+      _renderInlineMd(h[2], node);
+      container.appendChild(node);
+      i++;
+      continue;
+    }
+    // Blockquote (collapses adjacent > lines into one block)
+    if (/^>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        buf.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      const bq = document.createElement('blockquote');
+      _renderInlineMd(buf.join(' '), bq);
+      container.appendChild(bq);
+      continue;
+    }
+    // Unordered list
+    if (/^\s*[-*]\s+/.test(line)) {
+      const ul = document.createElement('ul');
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        const li = document.createElement('li');
+        _renderInlineMd(lines[i].replace(/^\s*[-*]\s+/, ''), li);
+        ul.appendChild(li);
+        i++;
+      }
+      container.appendChild(ul);
+      continue;
+    }
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const ol = document.createElement('ol');
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        const li = document.createElement('li');
+        _renderInlineMd(lines[i].replace(/^\s*\d+\.\s+/, ''), li);
+        ol.appendChild(li);
+        i++;
+      }
+      container.appendChild(ol);
+      continue;
+    }
+    // Blank line — paragraph separator
+    if (line.trim() === '') { i++; continue; }
+    // Paragraph: collect consecutive non-block lines
+    const buf = [];
+    while (i < lines.length) {
+      const l = lines[i];
+      if (l.trim() === '') break;
+      if (/^\s*(```|#{1,6}\s|>\s?|[-*]\s|\d+\.\s)/.test(l)) break;
+      buf.push(l);
+      i++;
+    }
+    const p = document.createElement('p');
+    _renderInlineMd(buf.join(' '), p);
+    container.appendChild(p);
+  }
+}
+
+// Inline tokenizer: greedy match on `code`, **bold**, *italic*, [text](url).
+// Recursion depth bounded by maxDepth so adversarial nested input can't blow
+// the stack.
+function _renderInlineMd(text, parent, depth) {
+  const d = depth || 0;
+  if (d > 6) { parent.appendChild(document.createTextNode(text)); return; }
+  let pos = 0;
+  while (pos < text.length) {
+    const remain = text.slice(pos);
+    let m;
+    // Code span
+    if ((m = /^`([^`\n]+)`/.exec(remain))) {
+      const node = document.createElement('code');
+      node.textContent = m[1];
+      parent.appendChild(node);
+      pos += m[0].length;
+      continue;
+    }
+    // Bold (** or __)
+    if ((m = /^(\*\*|__)([\s\S]+?)\1/.exec(remain))) {
+      const node = document.createElement('strong');
+      _renderInlineMd(m[2], node, d + 1);
+      parent.appendChild(node);
+      pos += m[0].length;
+      continue;
+    }
+    // Italic (single * or _)
+    if ((m = /^(\*|_)([^*_\n]+?)\1/.exec(remain))) {
+      const node = document.createElement('em');
+      _renderInlineMd(m[2], node, d + 1);
+      parent.appendChild(node);
+      pos += m[0].length;
+      continue;
+    }
+    // Link [text](url)
+    if ((m = /^\[([^\]\n]+)\]\(([^)\s]+)\)/.exec(remain))) {
+      const url = m[2];
+      // Strict URL safety: http(s)://… or relative path. Reject
+      // javascript:, data:, vbscript:, and bare schemes by anchor.
+      const safe = /^https?:\/\//i.test(url) || /^\//.test(url);
+      const dangerous = /^(javascript|data|vbscript|file):/i.test(url);
+      if (safe && !dangerous) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.textContent = m[1];
+        a.rel = 'noopener noreferrer nofollow';
+        a.target = '_blank';
+        parent.appendChild(a);
+      } else {
+        parent.appendChild(document.createTextNode(m[0]));
+      }
+      pos += m[0].length;
+      continue;
+    }
+    // Bare URL autolink. Some LLMs emit URLs without [text](url)
+    // syntax (e.g. CJK-bracketed 【https://...】 or inline plain
+    // links). Recognise http(s)://… up to whitespace or a closing
+    // bracket-class char, then strip trailing punctuation that\'s
+    // almost always sentence punctuation rather than part of the URL.
+    if ((m = /^(https?:\/\/[^\s<>"【】\[\]]+)/i.exec(remain))) {
+      let url = m[1];
+      // Drop common trailing punctuation: . , ; : ! ? ) ] 】 >
+      while (url.length > 8 && /[.,;:!?)\]】>]$/.test(url)) {
+        url = url.slice(0, -1);
+      }
+      // Same safety check as the bracketed-link form. javascript:
+      // / data: can\'t actually appear after http:// but the
+      // dangerous-prefix test is cheap defence-in-depth.
+      const safe = /^https?:\/\//i.test(url);
+      const dangerous = /^(javascript|data|vbscript|file):/i.test(url);
+      if (safe && !dangerous) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.textContent = url;
+        a.rel = 'noopener noreferrer nofollow';
+        a.target = '_blank';
+        parent.appendChild(a);
+        pos += url.length;
+        continue;
+      }
+    }
+    // Plain text — chunk until next inline special OR a bare-URL
+    // boundary (so the autolinker above can match on the next pass).
+    let next = remain.length;
+    for (let j = 1; j < remain.length; j++) {
+      if (MD_INLINE_SPECIALS.indexOf(remain[j]) !== -1) { next = j; break; }
+    }
+    const httpIdx = remain.search(/https?:\/\//i);
+    if (httpIdx > 0 && httpIdx < next) next = httpIdx;
+    const end = next;
+    parent.appendChild(document.createTextNode(remain.slice(0, end)));
+    pos += end;
+  }
+}
+
 export function mountOwnifyChat(root, opts) {
   if (!root || typeof root !== 'object' || root.nodeType !== 1) {
     throw new Error('mountOwnifyChat: root must be an HTMLElement');
@@ -283,7 +547,17 @@ export function mountOwnifyChat(root, opts) {
     input.value = '';
     addMsg('user', msg);
     setBusy(true);
-    const pending = addMsg('agent', '…');
+    // Pending bubble with an animated typing indicator (3 bouncing
+    // dots) so the visitor sees the agent is working, not stuck.
+    // True token streaming would need an SSE-aware A2A protocol on
+    // the receiver — out of scope here; this is the cheap UX win.
+    const pending = addMsg('agent', '');
+    pending.classList.add('ow-chat-typing');
+    for (let __i = 0; __i < 3; __i++) {
+      const __dot = doc.createElement('span');
+      __dot.className = 'ow-chat-typing-dot';
+      pending.appendChild(__dot);
+    }
 
     const ac = new AbortController();
     inflightController = ac;
@@ -311,6 +585,9 @@ export function mountOwnifyChat(root, opts) {
         referrerPolicy: 'no-referrer',
       });
       if (destroyed) return;
+      // Reply / error is about to land — drop the typing indicator so
+      // the bubble can render its real content.
+      pending.classList.remove('ow-chat-typing');
       // Check status BEFORE parsing the body. A malicious / compromised
       // backend returning HTTP 500 with a multi-MB JSON payload would
       // freeze the visitor's tab if we await r.json() unconditionally.
@@ -335,15 +612,19 @@ export function mountOwnifyChat(root, opts) {
         // Cap rendered reply size — defends the visitor's browser
         // against a malicious / compromised backend streaming a
         // huge reply that would freeze the tab.
-        pending.textContent = reply.length > MAX_REPLY_LENGTH
+        const capped = reply.length > MAX_REPLY_LENGTH
           ? reply.slice(0, MAX_REPLY_LENGTH) + '…'
           : reply;
+        // Render markdown safely (createElement + textContent only;
+        // no innerHTML; URL allowlist on links).
+        renderMarkdownSafe(capped, pending);
       } else {
         try { console.warn('ownify-chat: unexpected response shape (logged length only):', typeof body, (body && body.length) || 0); } catch { /* ignore */ }
         pending.textContent = 'Received an unexpected response.';
       }
     } catch (err) {
       if (destroyed) return;
+      pending.classList.remove('ow-chat-typing');
       const aborted = err && (err.name === 'AbortError' || err.message === 'aborted');
       // Log only err.name (consistent with the HTTP-error path that
       // logs only the status). Avoids handing the full error object —
@@ -406,6 +687,13 @@ export function bootstrapOwnifyChat(defaults) {
   for (const node of nodes) {
     if (node.dataset.ownifyChatInit === '1') continue;
     try {
+      // numeric data-* attrs come through as strings — coerce + drop
+      // values that aren't finite (lets mountOwnifyChat fall back to
+      // its own defaults rather than failing the bound check).
+      const numAttr = (raw) => {
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : undefined;
+      };
       mountOwnifyChat(node, {
         slug: node.dataset.slug,
         baseUrl: node.dataset.baseUrl,
@@ -418,6 +706,12 @@ export function bootstrapOwnifyChat(defaults) {
         styleNonce: node.dataset.styleNonce || opts.styleNonce,
         // data-credentials wasn't wired in 0.1.2 — fixed.
         credentials: node.dataset.credentials,
+        // 0.1.4: numeric overrides exposed via data-* attrs so
+        // operators on slow upstreams (e.g. self-hosted LLMs that
+        // can take 30-120s per turn) can lift the timeout without
+        // dropping into the JS API.
+        fetchTimeoutMs: numAttr(node.dataset.fetchTimeoutMs),
+        submitCooldownMs: numAttr(node.dataset.submitCooldownMs),
       });
     } catch (err) {
       try { console.warn('ownify-chat: failed to bootstrap node:', err && err.message); } catch { /* ignore */ }
